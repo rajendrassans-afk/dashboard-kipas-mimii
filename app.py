@@ -12,7 +12,7 @@ from core.data import scan_dataset, load_wav, validate_audio, resample_to, EXPEC
 from core.features import FeatureConfig, FEATURE_SETS, build_matrix, extract
 from core import models as MD
 from core.synth import fan
-from views import concepts
+from core.views import concepts
 
 st.set_page_config(page_title="Kondisi Kipas · Mat 3", page_icon="🌀", layout="wide")
 BLUE, ORANGE, GREY = "#1F5FBF", "#E4572E", "#8A94A6"
