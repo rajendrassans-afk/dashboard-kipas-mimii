@@ -1,9 +1,10 @@
 """Dashboard NRP 2 — Klasifikasi Kondisi Kipas Pendingin Panel Elektronika (MIMII fan)."""
-import io, datetime as dt
+import io, tempfile, datetime as dt
 from pathlib import Path
 import numpy as np, pandas as pd, joblib
 import plotly.graph_objects as go, plotly.express as px
 import streamlit as st
+import soundfile as sf
 from sklearn import metrics as skm
 
 from core import mathcore as M
@@ -11,7 +12,7 @@ from core.data import scan_dataset, load_wav, validate_audio, resample_to, EXPEC
 from core.features import FeatureConfig, FEATURE_SETS, build_matrix, extract
 from core import models as MD
 from core.synth import fan
-from core.views import concepts
+from views import concepts
 
 st.set_page_config(page_title="Kondisi Kipas · Mat 3", page_icon="🌀", layout="wide")
 BLUE, ORANGE, GREY = "#1F5FBF", "#E4572E", "#8A94A6"
@@ -48,21 +49,62 @@ def cfg_widgets(prefix="", expanded=True):
     return FeatureConfig(n_fft=n_fft, hop=n_fft // 2, n_mels=n_mels, n_mfcc=n_mfcc, feature_set=FEATURE_SETS[fs_name])
 
 def log_history(rec):
-    df = pd.DataFrame([rec])
-    df.to_csv(HIST, mode="a", header=not HIST.exists(), index=False)
+    try:
+        pd.DataFrame([rec]).to_csv(HIST, mode="a", header=not HIST.exists(), index=False)
+    except OSError:
+        pass  # filesystem hosting read-only: histori tidak tersimpan
 
-# ------------------------------------------------------------ halaman
+TMP = Path(tempfile.gettempdir())
+DEMO_DIR = TMP / "mimii_demo_synthetic"
+
+def make_demo_dataset(ids=3, n_normal=45, n_abn=20):
+    """Data SINTETIS (struktur mirip MIMII) agar semua halaman bisa dicoba tanpa dataset asli."""
+    if (DEMO_DIR / "fan").exists():
+        return str(DEMO_DIR)
+    rng = np.random.default_rng(1)
+    for i in range(ids):
+        for lab, n in (("normal", n_normal), ("abnormal", n_abn)):
+            d = DEMO_DIR / "fan" / f"id_{i*2:02d}" / lab; d.mkdir(parents=True, exist_ok=True)
+            for k in range(n):
+                kind = "normal" if lab == "normal" else str(rng.choice(["imbalance", "rattle", "friction"]))
+                sf.write(d / f"{k:08d}.wav", fan(rng, kind, f0=45 + 6 * i + rng.normal(0, .5)), 16000)
+    return str(DEMO_DIR)
+
+def train_demo_model():
+    """Buat data demo -> ekstrak fitur -> latih RF cepat. Hasil disimpan di session."""
+    root = make_demo_dataset(); df = scan_dataset(root, "fan")
+    cfg = FeatureConfig(feature_set="mfcc_spec")
+    X, names = build_matrix(df.path.tolist(), cfg, cache_dir=str(TMP / "mimii_demo_cache"))
+    y = df.label.values; tr, te = MD.split(X, y, df.id.values, "acak", .25)
+    mdl, proba, r = MD.fit_eval("Random Forest", X, y, tr, te, n_estimators=100)
+    S.update(df=df, demo=True, root=root, model=mdl, cfg=cfg, feat_names=names, X=X, y=y, tr=tr, te=te, proba=proba, result=r,
+             d=df.reset_index(drop=True), cfg_exp=dict(n_est=100, depth=None, leaf=1, mode="acak"))
+
+@st.cache_data
+def sample_wav(kind):
+    b = io.BytesIO(); sf.write(b, fan(np.random.default_rng(99), kind, f0=50.0), 16000, format="WAV"); return b.getvalue()
+
+def demo_banner():
+    if S.get("demo"):
+        st.warning("**MODE DEMO — data sintetis (bukan MIMII).** Angka di halaman ini hanya untuk mencoba fitur dashboard, "
+                   "bukan hasil penelitian. Untuk hasil sebenarnya jalankan dengan dataset MIMII asli di komputermu.", icon="⚠️")
+
 def page_data():
     st.title("Data & Validasi")
     st.markdown("Struktur yang dibaca: `<folder>/.../fan/id_XX/{normal,abnormal}/*.wav` (hasil ekstrak zip MIMII, termasuk varian `-6_dB`, `0_dB`, `6_dB`). "
                 "Label hanya dipakai untuk **evaluasi/supervisi**, masukan utama tetap sinyal suara.")
     root = st.text_input("Folder dataset", S.get("root", "./dataset"), help="Folder hasil ekstrak MIMII (zip dari Zenodo).")
-    if st.button("Pindai dataset", type="primary"):
-        S["root"] = root; S["df"] = scan_dataset(root, "fan")
+    b1, b2 = st.columns([1, 2])
+    if b1.button("Pindai dataset", type="primary"):
+        S["root"] = root; S["df"] = scan_dataset(root, "fan"); S["demo"] = False
+    if b2.button("Pakai data demo sintetis (tanpa dataset)"):
+        with st.spinner("Membuat data demo…"):
+            S["root"] = make_demo_dataset(); S["df"] = scan_dataset(S["root"], "fan"); S["demo"] = True
+    demo_banner()
     df = S.get("df")
     if df is None:
         st.info("Belum ada data. Unduh `fan` dari https://zenodo.org/records/3384388, ekstrak, lalu isi path di atas. "
-                "Untuk uji coba cepat: `python tools/make_synthetic.py --out demo_synthetic` (data SINTETIS, hanya untuk tes aplikasi)."); return
+                "Atau klik **Pakai data demo sintetis** untuk mencoba dashboard."); return
     if df.empty:
         st.error("Tidak ditemukan file normal/abnormal untuk 'fan'. Periksa path & struktur folder."); return
     c = st.columns(4); c[0].metric("Total klip", len(df)); c[1].metric("Normal", int((df.label == 0).sum()))
@@ -115,7 +157,13 @@ def page_experiment():
     st.title("Eksperimen & Evaluasi")
     df = S.get("df")
     if df is None or df.empty or df.label.nunique() < 2:
-        st.info("Pindai dataset yang memiliki kelas normal & abnormal di halaman *Data & Validasi*."); return
+        st.info("Belum ada dataset. Di halaman *Data & Validasi* pindai folder MIMII, atau klik **Pakai data demo sintetis** untuk mencoba.")
+        if st.button("Pakai data demo sintetis sekarang"):
+            with st.spinner("Membuat data demo…"):
+                S["root"] = make_demo_dataset(); S["df"] = scan_dataset(S["root"], "fan"); S["demo"] = True
+            st.rerun()
+        return
+    demo_banner()
     with st.expander("1 · Seleksi data & konfigurasi fitur", expanded=True):
         c1, c2 = st.columns(2)
         ids = c1.multiselect("ID mesin", sorted(df.id.unique()), default=sorted(df.id.unique()))
@@ -132,14 +180,17 @@ def page_experiment():
         tsz = c[4].slider("Porsi uji", .1, .5, .25, .05)
     if st.button("Ekstrak fitur & latih Random Forest", type="primary"):
         bar = st.progress(0.0, "Ekstraksi STFT→MFCC…")
-        X, names = build_matrix(d.path.tolist(), cfg, cache_dir=str(ROOT / "cache"), progress=lambda p: bar.progress(p, "Ekstraksi STFT→MFCC…"))
+        X, names = build_matrix(d.path.tolist(), cfg, cache_dir=str(TMP / "mimii_cache" if S.get("demo") else ROOT / "cache"), progress=lambda p: bar.progress(p, "Ekstraksi STFT→MFCC…"))
         bar.empty()
         y = d.label.values; groups = d.id.values
         tr, te = MD.split(X, y, groups, mode, tsz)
         if len(set(y[te])) < 2 or len(set(y[tr])) < 2:
             st.error("Pembagian menghasilkan satu kelas saja pada latih/uji. Ubah skema/porsi uji."); return
         mdl, proba, r = MD.fit_eval("Random Forest", X, y, tr, te, n_estimators=n_est, max_depth=depth, min_samples_leaf=leaf)
-        MODEL_F.parent.mkdir(exist_ok=True); joblib.dump(dict(model=mdl, cfg=cfg, names=names), MODEL_F)
+        try:
+            MODEL_F.parent.mkdir(exist_ok=True); joblib.dump(dict(model=mdl, cfg=cfg, names=names), MODEL_F)
+        except OSError:
+            pass
         S.update(model=mdl, cfg=cfg, feat_names=names, X=X, y=y, tr=tr, te=te, proba=proba, result=r, d=d.reset_index(drop=True),
                  cfg_exp=dict(n_est=n_est, depth=depth, leaf=leaf, mode=mode))
     if "result" not in S: return
@@ -188,7 +239,7 @@ def page_experiment():
             bar = st.progress(0.0)
             for i, (nf, nm, fs) in enumerate(combos):
                 c_ = FeatureConfig(n_fft=nf, hop=nf // 2, n_mfcc=nm, feature_set=fs)
-                Xc, _ = build_matrix(d.path.tolist(), c_, cache_dir=str(ROOT / "cache"))
+                Xc, _ = build_matrix(d.path.tolist(), c_, cache_dir=str(TMP / "mimii_cache" if S.get("demo") else ROOT / "cache"))
                 _, _, rr = MD.fit_eval("Random Forest", Xc, y, tr_, te); rows.append(dict(n_fft=nf, n_mfcc=str(nm) if fs != "logmel" else "-", fitur=fs, f1=rr["f1"], auc=rr["auc"], dim=Xc.shape[1]))
                 bar.progress((i + 1) / len(combos))
             S["cmp_feat"] = pd.DataFrame(rows)
@@ -200,7 +251,18 @@ def page_predict():
     if "model" not in S and MODEL_F.exists():
         o = joblib.load(MODEL_F); S.update(model=o["model"], cfg=o["cfg"], feat_names=o["names"])
     if "model" not in S:
-        st.info("Latih model dulu di halaman *Eksperimen* (atau letakkan `model/rf_fan.joblib`)."); return
+        st.info("Belum ada model. Latih di halaman *Eksperimen* (dataset MIMII), atau letakkan `model/rf_fan.joblib`.")
+        if st.button("Latih model demo cepat (data sintetis)", type="primary"):
+            with st.spinner("Membuat data demo & melatih Random Forest (±20 detik)…"):
+                train_demo_model()
+            st.rerun()
+        return
+    demo_banner()
+    if S.get("demo"):
+        a, b = st.columns(2)
+        a.download_button("⬇ Contoh WAV: kipas normal (sintetis)", sample_wav("normal"), "contoh_normal.wav", "audio/wav")
+        b.download_button("⬇ Contoh WAV: kipas abnormal (sintetis)", sample_wav("rattle"), "contoh_abnormal.wav", "audio/wav")
+        st.caption("Unduh contoh, lalu unggah kembali di bawah untuk mencoba prediksi.")
     c1, c2 = st.columns(2); lo = c1.slider("Batas WASPADA (P abnormal ≥)", .05, .6, MD.WARN_LOW, .05); hi = c2.slider("Batas ABNORMAL (P abnormal ≥)", .2, .95, MD.WARN_HIGH, .05)
     ups = st.file_uploader("Unggah satu/lebih WAV", type=["wav"], accept_multiple_files=True)
     for up in ups:
